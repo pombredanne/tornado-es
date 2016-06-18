@@ -5,3 +5,5 @@ tornadoes.egg-info/
 .pydevproject
 .project
 .settings/
+.coverage
+.tox/

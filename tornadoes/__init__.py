@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 
-import json
+from tornadoes.models import BulkList
 
-from models import BulkList
-
-from urllib import urlencode
+from six.moves.urllib.parse import urlencode
+from tornado.escape import json_encode, json_decode
 from tornado.ioloop import IOLoop
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.concurrent import return_future
@@ -12,72 +11,73 @@ from tornado.concurrent import return_future
 
 class ESConnection(object):
 
-    def __init__(self, host='localhost', port='9200', io_loop=None):
+    def __init__(self, host='localhost', port='9200', io_loop=None, protocol='http'):
         self.io_loop = io_loop or IOLoop.instance()
-        self.url = "http://%(host)s:%(port)s" % {"host": host, "port": port}
+        self.url = "%(protocol)s://%(host)s:%(port)s" % {"protocol": protocol, "host": host, "port": port}
         self.bulk = BulkList()
         self.client = AsyncHTTPClient(self.io_loop)
+        self.httprequest_kwargs = {}     # extra kwargs passed to tornado's HTTPRequest class e.g. request_timeout
 
     def create_path(self, method, **kwargs):
-        index = kwargs.get('index', '_all')
-        type_ = '/' + kwargs.get('type') if 'type' in kwargs else ''
+        index = kwargs.pop('index', '_all')
+        doc_type = '/%s' % kwargs.pop('type', '')
+
         parameters = {}
-        for param in ['size', 'from', 'routing']:
-            value = kwargs.get(param, None)
-            if value:
-                parameters[param] = value
-        if 'page' in kwargs:
-            parameters.setdefault('size', 10)
-            parameters['from'] = (kwargs['page'] - 1) * parameters['size']
-        jsonp_callback = kwargs.get('jsonp_callback', '')
-        if jsonp_callback:
-            parameters['callback'] = jsonp_callback
+        for param, value in kwargs.items():
+            parameters[param] = value
+
         path = "/%(index)s%(type)s/_%(method)s" % {
             "method": method,
             "index": index,
-            "type": type_
+            "type": doc_type
         }
         if parameters:
-            path += '?'+urlencode(parameters)
+            path += '?' + urlencode(parameters)
 
         return path
 
     @return_future
     def search(self, callback, **kwargs):
         path = self.create_path("search", **kwargs)
-        source = json.dumps(kwargs.get('source', {"query": {"query_string": {"query": "*"}}}))
+        source = json_encode(kwargs.get('source', {
+            "query": {
+                "match_all": {}
+            }
+        }))
         self.post_by_path(path, callback, source)
 
     def multi_search(self, index, source):
         self.bulk.add(index, source)
 
     @return_future
-    def apply_search(self, callback):
+    def apply_search(self, callback, params={}):
         path = "/_msearch"
+        if params:
+            path = "%s?%s" % (path, urlencode(params))
         source = self.bulk.prepare_search()
         self.post_by_path(path, callback, source=source)
 
     def post_by_path(self, path, callback, source):
         url = '%(url)s%(path)s' % {"url": self.url, "path": path}
-        request_http = HTTPRequest(url, method="POST", body=source)
+        request_http = HTTPRequest(url, method="POST", body=source, **self.httprequest_kwargs)
         self.client.fetch(request=request_http, callback=callback)
 
     @return_future
     def get_by_path(self, path, callback):
         url = '%(url)s%(path)s' % {"url": self.url, "path": path}
-        self.client.fetch(url, callback)
+        self.client.fetch(url, callback, **self.httprequest_kwargs)
 
     @return_future
-    def get(self, index, type, uid, callback):
+    def get(self, index, type, uid, callback, parameters=None):
         def to_dict_callback(response):
-            source = json.loads(response.body).get('_source', {})
+            source = json_decode(response.body)
             callback(source)
-        self.request_document(index, type, uid, callback=to_dict_callback)
+        self.request_document(index, type, uid, callback=to_dict_callback, parameters=parameters)
 
     @return_future
     def put(self, index, type, uid, contents, parameters=None, callback=None):
         self.request_document(
-            index, type, uid, "PUT", body=json.dumps(contents),
+            index, type, uid, "PUT", body=json_encode(contents),
             parameters=parameters, callback=callback)
 
     @return_future
@@ -97,7 +97,7 @@ class ESConnection(object):
             path += '?{}'.format(urlencode(parameters or {}))
 
         if source:
-            source = json.dumps(source['query'])
+            source = json_encode(source)
 
         self.post_by_path(path=path, callback=callback, source=source)
 
@@ -108,7 +108,8 @@ class ESConnection(object):
             "path": path,
             "querystring": urlencode(parameters or {})
         }
-        request_arguments = dict(method=method)
+        request_arguments = dict(self.httprequest_kwargs)
+        request_arguments['method'] = method
 
         if body is not None:
             request_arguments['body'] = body
